@@ -1,0 +1,806 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+#pragma enable_d3d11_debug_symbols
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+float4 _DirectionalLight;
+
+float2 _PixelOffset;
+
+Texture2D<float4> _SkyboxTexture;
+SamplerState sampler_SkyboxTexture;
+
+//limiter
+int _rayLimit;
+
+//gravity lensing
+StructuredBuffer<float> _textureGravity;
+int _textureWidth;
+int _textureHeight;
+
+static const float PI = 3.14159265f;
+
+//3D mesh
+struct SubMeshMaterial
+{
+    int sub;
+    int textureId;
+    float4 c;
+    float2 tiling;
+    float2 offset;
+};
+struct TransformPack
+{
+    int meshId;
+    float3 position;
+    float4 rotation;
+    float3 scale;
+};
+StructuredBuffer<float3> _static_V;
+StructuredBuffer<float3> _static_N;
+StructuredBuffer<float2> _static_UV;
+StructuredBuffer<int3> _static_T;
+StructuredBuffer<float3> _static_B;
+StructuredBuffer<int3> _static_bvh;
+StructuredBuffer<SubMeshMaterial> _static_SUB2;
+StructuredBuffer<int> _static_IND;
+
+StructuredBuffer<TransformPack> _static_transforms;
+
+//textures
+StructuredBuffer<float4> _static_Textures;
+StructuredBuffer<int3> _static_Textures_IND; //table start index, width, height
+
+//GRAVITY
+struct BlackHole
+{
+    float3 position;
+    float rs;
+};
+StructuredBuffer<BlackHole> _BlackHoles;
+
+BlackHole createBlackHole()
+{
+    BlackHole bh;
+    bh.position = float3(0,0,0);
+    bh.rs = 0;
+    return bh;
+}
+
+//-------------------------------------
+//- RANDOMNESS
+
+float2 _Pixel;
+float _Seed;
+
+float rand()
+{
+    float result = frac(sin(_Seed / 100.0f * dot(_Pixel, float2(12.9898f, 78.233f))) * 43758.5453f);
+    _Seed += 1.0f;
+    return result;
+}
+
+float4 getPixel(float2 UV, SubMeshMaterial mat)
+{
+    int3 dat = _static_Textures_IND[mat.textureId];
+    int t_ = dat.x; //index
+    int w = dat.y; //width
+    int h = dat.z; //height
+
+    float2 UV2 = UV * mat.tiling + mat.offset;
+
+    UV2.x = (UV2.x - (int) UV2.x);
+    UV2.y = (UV2.y - (int) UV2.y);
+
+    float2 pos = float2(UV2.x * (float) w, UV2.y * (float) h);
+
+    int2 posInt = int2((int) pos.x, (int) pos.y);
+
+    float4 col = _static_Textures[t_ + (posInt.y * w + posInt.x)];
+    return col;
+}
+//
+
+//-------------------------------------
+//- PRZECIĘCIE TRÓJKĄTA
+bool rayTriangleCheck(float3 rayOrigin,
+                           float3 rayVector,
+                           float3 vertex0,
+                           float3 vertex1,
+                           float3 vertex2,
+                           out float3 outIntersectionPoint)
+{
+    outIntersectionPoint = float3(0, 0, 0);
+
+    float EPSILON = 0.0000001f;
+    float3 edge1, edge2, h, s, q;
+    float a, f, u, v;
+    edge1 = vertex1 - vertex0;
+    edge2 = vertex2 - vertex0;
+    h = cross(rayVector, edge2);
+    a = dot(edge1, h);
+    if (a > -EPSILON && a < EPSILON)
+        return false; // This ray is parallel to this triangle.
+    f = 1.0f / a;
+    s = rayOrigin - vertex0;
+    u = f * (dot(s, h));
+    if (u < 0.0 || u > 1.0)
+        return false;
+    q = cross(s, edge1);
+    v = f * dot(rayVector, q);
+    if (v < 0.0 || u + v > 1.0)
+        return false;
+        // At this stage we can compute t to find out where the intersection point is on the line.
+    float t = f * dot(edge2, q);
+    if (t > EPSILON) // ray intersection
+    {
+        outIntersectionPoint = rayOrigin + rayVector * t;
+        return true;
+    }
+    else // This means that there is a line intersection but not a ray intersection.
+        return false;
+}
+
+//- PRZECIĘCIE BOXA
+float max3(float a, float b, float c)
+{
+    return max(a, max(b, c));
+}
+float min3(float a, float b, float c)
+{
+    return min(a, min(b, c));
+}
+
+bool rayBoxCheck(float3 p, float3 d, float3 a, float3 A, out float distance)
+{
+    distance = 1.#INF;
+    float t1 = (a.x - p.x) / d.x;
+    float t2 = (A.x - p.x) / d.x;
+    float t3 = (a.y - p.y) / d.y;
+    float t4 = (A.y - p.y) / d.y;
+    float t5 = (a.z - p.z) / d.z;
+    float t6 = (A.z - p.z) / d.z;
+    float tmin = max3(min(t1, t2), min(t3, t4), min(t5, t6));
+    float tmax = min3(max(t1, t2), max(t3, t4), max(t5, t6));
+    if (tmax < 0)
+        return false;
+    else if (tmin > tmax)
+        return false;
+    distance = tmin;
+    return true;
+}
+//WYKRYWANIE OBIEKTOW
+bool BVHsearch(float3 origin_, float3 direction_, float rayLength, float3 scale, int bvh_, int b_, int t_, int v_, int s_, int s_c, out float3 output, out float4 color, out float3 normal)
+{
+    int stos[100];
+    int stosIndex = 0;
+
+    int bvhindex = 0;
+    int lastindex = 0;
+
+    bool stopCondition = false;
+
+    bool emptyHit = true;
+    float3 bestHit = float3(0, 0, 0);
+    float bestHitDist = 9999999;
+    int bestTriangleId = 0;
+
+    //int loopLimiter = 100000;//duża wartosc
+    int loopLimiter = 10000; //duża wartosc
+
+    while (true)
+    {
+        loopLimiter--;
+        if (loopLimiter <= 0)
+            break;
+
+        stos[stosIndex] = bvhindex;
+        int currentIndex = bvhindex;
+        int3 node = _static_bvh[bvhindex + bvh_];
+
+        if (node.y == 0 && node.z == 0)
+        {
+            //triangle
+            float3 trOutput;
+            bool res = rayTriangleCheck(origin_, direction_, _static_V[_static_T[node.x + t_].x + v_] * scale, _static_V[_static_T[node.x + t_].y + v_] * scale, _static_V[_static_T[node.x + t_].z + v_] * scale, trOutput);
+        
+            if (res)
+            {
+                float f = length(trOutput - origin_);
+                if (emptyHit == true || f < bestHitDist)
+                {
+                    emptyHit = false;
+                    bestHitDist = f;
+                    bestHit = trOutput;
+                    bestTriangleId = node.x;
+                }
+            }
+
+            //w gore
+            stosIndex--;
+            if (stosIndex < 0)
+                break;
+            bvhindex = stos[stosIndex];
+        }
+        else
+        {
+            //check collision
+            //box
+            if (lastindex != node.y && lastindex != node.z)
+            {
+                float boxDist;
+                bool res = rayBoxCheck(origin_, direction_, _static_B[node.x + b_] * scale, _static_B[node.x + b_ + 1] * scale, boxDist);
+                if (res && boxDist > rayLength && rayLength != 1.#INF)
+                    res = false;
+                if (res)
+                {
+                    //wejdz w lewy
+                    bvhindex = node.y;
+                    stosIndex++;
+                }
+                else
+                {
+                    stosIndex--;
+                    if (stosIndex < 0)
+                        break;
+                    bvhindex = stos[stosIndex];
+                }
+            }
+            else if (lastindex == node.y)
+            {
+                //wejdz w prawy
+                bvhindex = node.z;
+                stosIndex++;
+            }
+            else if (lastindex == node.z)
+            {
+                //wroc w gore
+                stosIndex--;
+                if (stosIndex < 0)
+                    break;
+                bvhindex = stos[stosIndex];
+            }
+        }
+        lastindex = currentIndex;
+    }
+    //koniec petli
+    output = bestHit;
+    color = float4(1, 1, 0, 0);
+    if (!emptyHit && true)
+    {
+        //trafienie
+        //int3 tr = _static_T[ bestTriangleId+t_];
+        SubMeshMaterial mat;
+        if (s_c == 1)
+        {
+            mat = _static_SUB2[s_];
+        }
+        else if (s_c > 1)
+        {
+            for (int i = s_c - 1; i >= 0; --i)
+            {
+                SubMeshMaterial mat0 = _static_SUB2[s_ + i];
+                if (bestTriangleId >= mat0.sub)
+                {
+                    mat = mat0;
+                    break;
+                }
+            }
+        }
+
+        int3 tr = _static_T[t_ + bestTriangleId];
+        float3 Ce = bestHit;
+        float3 A = _static_V[v_ + tr.x] * scale;
+        float3 B = _static_V[v_ + tr.y] * scale;
+        float3 C = _static_V[v_ + tr.z] * scale;
+        float3 A_diff = (B - A);
+        float3 B_diff = (C - B);
+        float3 C_diff = (A - C);
+            
+        float P0 = length(cross(A_diff, C_diff)) / 2.0f;
+
+        float PC = length(cross(A_diff, (Ce - A)) / 2.0f) / P0;
+        float PA = length(cross(B_diff, (Ce - B)) / 2.0f) / P0;
+        float PB = length(cross(C_diff, (Ce - C)) / 2.0f) / P0;
+        normal = _static_N[v_ + tr.x] * PA + _static_N[v_ + tr.y] * PB + _static_N[v_ + tr.z] * PC;
+        if (mat.textureId == -1)
+        {
+            color = mat.c;
+        }
+        else
+        {
+            color = mat.c;
+
+            float2 UVA = _static_UV[v_ + tr.x];
+            float2 UVB = _static_UV[v_ + tr.y];
+            float2 UVC = _static_UV[v_ + tr.z];
+
+            float2 UV = (UVA * PA) + (UVB * PB) + (UVC * PC);
+
+            //normal Vector
+            normal = _static_N[v_ + tr.x] * PA + _static_N[v_ + tr.y] * PB + _static_N[v_ + tr.z] * PC;
+
+            color = getPixel(UV, mat);
+            //color = float4(PA, PB, PC, 0);
+        }
+    }
+    return !emptyHit;
+}
+
+float4 quaternionInv(float4 q)
+{
+    float sum = q.x * q.x +
+        q.y * q.y +
+        q.z * q.z +
+        q.w * q.w;
+    return float4(-q.x / sum, -q.y / sum, -q.z / sum, q.w / sum);
+}
+float4 quaternionCross(float4 q, float4 r)
+{
+    float t0 = q.x * r.x - q.y * r.y - q.z * r.z - q.w * r.w;
+    float t1 = q.y * r.x + q.x * r.y - q.w * r.z + q.z * r.w;
+    float t2 = q.z * r.x + q.w * r.y + q.x * r.z - q.y * r.w;
+    float t3 = q.w * r.x - q.z * r.y + q.y * r.z + q.x * r.w;
+    return float4(t0, t1, t2, t3);
+}
+float3 vectorQRotation(float3 v, float4 q)
+{
+    float x = q.x;
+    float y = q.y;
+    float z = q.z;
+    float w = q.w;
+    float3 m1 = float3(1 - 2 * y * y - 2 * z * z, 2 * x * y - 2 * z * w, 2 * x * z + 2 * y * w);
+    float3 m2 = float3(2 * x * y + 2 * z * w, 1 - 2 * x * x - 2 * z * z, 2 * y * z - 2 * x * w);
+    float3 m3 = float3(2 * x * z - 2 * y * w, 2 * y * z + 2 * x * w, 1 - 2 * x * x - 2 * y * y);
+
+    return float3(dot(m1, v), dot(m2, v), dot(m3, v));
+}
+//-------------------------------------
+//- RAYHIT
+
+struct RayHit
+{
+    float3 position;
+    float3 normal;
+    float4 emission;
+    float distance;
+};
+
+RayHit CreateRayHit()
+{
+    RayHit hit;
+    hit.position = float3(0.0f, 0.0f, 0.0f);
+    hit.normal = float3(0.0f, 0.0f, 0.0f);
+    hit.emission = float4(0.0f, 0.0f, 0.0f, 1.0f);
+    hit.distance = 1.#INF;
+    return hit;
+}
+//-------------------------------------
+//- RAY
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+    float3 energy;
+    float length;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    ray.energy = float3(1.0f, 1.0f, 1.0f);
+    ray.length = 1.#INF;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+
+    return CreateRay(origin, direction);
+}
+bool rayMeshCollisionChecker(Ray ray, out RayHit rh)
+{
+    //color = float4(0, 0, 0, 1);
+    //color = float4(direction.x * direction.x + origin.x / 100.0f, direction.y * direction.y + origin.y / 100.0f, direction.z * direction.z + origin.z / 100.0f, 1);
+    //outHitPoint = float3(0, 0, 0);
+
+    float3 direction = ray.direction;
+    float3 origin = ray.origin;
+
+    rh = CreateRayHit();
+    uint numObj, stride;
+    _static_transforms.GetDimensions(numObj, stride);
+
+
+    bool emptyHit = true;
+    float mind = 0;
+    for (uint i = 0; i < numObj; ++i)//killer
+    {
+        TransformPack obj = _static_transforms[i];
+
+        float4 invRotation = quaternionInv(obj.rotation);
+        float3 diff = origin - obj.position;
+        
+        float3 origin_ = vectorQRotation(diff, invRotation);
+        float3 direction_ = vectorQRotation(direction, invRotation);
+
+        //color = float4(direction_.x * direction_.x + origin_.x / 100.0f, direction_.y * direction_.y + origin_.y / 100.0f, direction_.z * direction_.z + origin_.z / 100.0f, 1);
+    
+
+        int index = obj.meshId * 6;
+
+        int id = _static_IND[index + 0];
+        int bvh = _static_IND[index + 1];
+        int b = _static_IND[index + 2];
+        int t = _static_IND[index + 3];
+        int v = _static_IND[index + 4];
+        int s = _static_IND[index + 5];
+        int id_, bvh_, b_, t_, v_, s_;
+
+        int IND_size;
+        _static_IND.GetDimensions((uint) IND_size, stride);
+        int Statics_count = IND_size / 6;
+
+
+        if (index < Statics_count - 1)
+        {
+            index += 6;
+            bvh_ = _static_IND[index + 1];
+            b_ = _static_IND[index + 2];
+            t_ = _static_IND[index + 3];
+            v_ = _static_IND[index + 4];
+            s_ = _static_IND[index + 5];
+        }
+        else
+        {
+            _static_bvh.GetDimensions((uint) bvh_, stride);
+            _static_B.GetDimensions((uint) b_, stride);
+            _static_T.GetDimensions((uint) t_, stride);
+            _static_V.GetDimensions((uint) v_, stride);
+            _static_SUB2.GetDimensions((uint) s_, stride);
+        }
+
+        float3 hitpoint;
+        float4 c;
+        float3 normal;
+
+        bool hit = BVHsearch(origin_, direction_, ray.length, obj.scale, bvh, b, t, v, s, (s_ - s), hitpoint, c, normal);
+
+        if (hit)
+        {
+            //emptyHit = false;
+            //color = float4(1, 0.5f, 0.5f, 1);
+            float d = distance(origin_, hitpoint);
+            if (d < mind || emptyHit)
+            {
+                mind = d;
+                hitpoint = vectorQRotation(hitpoint, obj.rotation);
+                hitpoint += obj.position;
+                //outHitPoint = hitpoint;
+                emptyHit = false;
+                //color = float4(0.0f, 1.0f, 0.5f, 1);
+                //color = c;
+
+                rh.emission = c;
+                rh.normal = normal;
+                rh.position = hitpoint;
+                rh.distance = d;
+            }
+        }
+    }
+    return !emptyHit;
+}
+
+//KONIEC KODU DOTYCZĄCEGO OBIEKTÓW 3D
+
+
+
+Ray rayQueue[100];
+int qHead=0;
+int qTail=0;
+int qSize=0;
+
+void PushRay(Ray ray)
+{
+    rayQueue[qTail] = ray;
+    ++qTail;
+    ++qSize;
+}
+bool PopRay(out Ray ret)
+{
+    if (qHead == qTail)
+    {
+        //error
+        Ray ray;
+        ret = ray;
+        return false;
+    }
+    else
+    {
+        ret = rayQueue[qHead];
+        ++qHead;
+        --qSize;
+        return true;
+    } 
+}
+
+
+//
+float angle(float3 a, float3 b)
+{
+    return acos(clamp(dot(normalize(a), normalize(b)), -1.0f, 1.0f));
+}
+
+float getApproachCollisionDistance(Ray ray, float3 pos)
+{
+    float3 tmp = pos - ray.origin;
+    return length(tmp) * dot(normalize(ray.direction), normalize(tmp));
+}
+
+bool getSimpleBlackholeCollision(Ray ray, int mode, out BlackHole blackHole, out float d)
+{
+    uint count = 0;
+    uint str = 0;
+    _BlackHoles.GetDimensions(count,str);
+
+    bool ret = false;
+    d = 0;
+    blackHole = createBlackHole();
+    if (mode == -1)
+    {
+        float max = -9999999;
+        for (int i = 0; i < count; i++)
+        {
+            BlackHole bh = _BlackHoles[i];
+            float a = getApproachCollisionDistance(ray, bh.position);
+            if (a < 0 && a > max)
+            {
+                max = a;
+                d = -max;
+                blackHole = bh;
+                ret = true;
+            }
+        }
+    }
+    else if (mode == 1)
+    {
+        float min = 9999999;
+        for (int i = 0; i < count; i++)
+        {
+            BlackHole bh = _BlackHoles[i];
+            float a = getApproachCollisionDistance(ray, bh.position);
+            if (a >= 0 && a < min)
+            {
+                min = a;
+                d = min;
+                blackHole = bh;
+                ret = true;
+            }
+        }
+    }
+    return ret;
+}
+
+float3 rodrigez(float3 v, float3 k, float angle)
+{
+    k = normalize(k);
+    float3 a0 = v * cos(angle);
+    float3 a1 = cross(k, v) * sin(angle);
+    float3 a2 = k * dot(k, v) * (1.0f - cos(angle));
+    return a0 + a1 + a2;
+}
+Ray bendRay(Ray ray, float3 position, float3 center, float angle)
+{
+    float3 bend = rodrigez(ray.direction, cross(ray.direction, center - ray.origin), angle);
+    Ray ret = CreateRay(position, bend);
+    return ret;
+}
+
+float getTableNearest(float x, float y)
+{
+    return _textureGravity[_textureWidth * (int)y + (int)x];
+}
+float getTableLinear(float tx, float ty)
+{
+    int ix0 = (int) (tx - 0.5f);
+    int iy0 = (int) (ty - 0.5f);
+    int ix1 = ix0 + 1;
+    int iy1 = iy0 + 1;
+
+    float pix00;
+    float pix01;
+    float pix10;
+    float pix11;
+
+    pix00 = _textureGravity[iy0 * _textureWidth + ix0];
+    pix01 = _textureGravity[iy0 * _textureWidth + ix1];
+    pix10 = _textureGravity[iy1 * _textureWidth + ix0];
+    pix11 = _textureGravity[iy1 * _textureWidth + ix1];
+
+    float tmp0 = pix00 + (pix01 - pix00) * ((tx - (ix0 + 0.5f)) / ((ix1 + 0.5f) - (ix0 + 0.5f)));
+    float tmp1 = pix10 + (pix11 - pix10) * ((tx - (ix0 + 0.5f)) / ((ix1 + 0.5f) - (ix0 + 0.5f)));
+    float tmp3 = tmp0 + (tmp1 - tmp0) * ((ty - (iy0 + 0.5f)) / ((iy1 + 0.5f) - (iy0 + 0.5f)));
+    return tmp3;
+}
+
+//x i y są od 0.0 do 1.0
+float getTable(float x, float y, int mode)
+{
+    float x2 = _textureWidth * x;
+    float y2 = _textureHeight * y;
+
+    float ret = -1;
+
+    if (x >= 1 || y >= 1)
+    {
+        //poza tekstura :(
+
+    }
+    else
+    {
+        if (mode == 0)
+        {
+            //nearest neighbour
+            ret = getTableNearest(x2, y2);
+        }
+        else if (mode == 1)
+        {
+            //linear interpolation
+            ret = getTableLinear(x2, y2);
+
+        }
+        else if (mode == 2)
+        {
+            //2
+
+        }
+    }
+    return ret;
+}
+float getBlackHoleAngle(BlackHole bc, Ray ray)
+{
+    float beta = 0;
+    float3 vr = bc.position - ray.origin;
+    float alpha = angle(ray.direction, vr);
+    float r = length(vr);
+
+    float _x_r = sqrt(sqrt(r))/4.0f;
+    float _y_alpha = alpha / PI;
+
+    float tableOutput = getTable(_x_r, _y_alpha,1);
+
+    if (tableOutput >= 6.0f)
+    {
+        return -1.0f;
+    }
+    beta = tableOutput * tableOutput * tableOutput * tableOutput * PI / 180.0f;//w radianach
+
+    return beta;
+}
+
+RayHit Trace(Ray ray)
+{
+    RayHit bestHit = CreateRayHit();
+    //bool hit = rayMeshCollisionChecker(ray, bestHit);
+    BlackHole bh;
+    float d;
+    bool ret = getSimpleBlackholeCollision(ray, 1, bh, d);
+    
+
+    return bestHit;
+}
+
+float3 getSkyboxPixel(Ray ray)
+{
+    // Sample the skybox and write it
+    float theta = acos(ray.direction.y) / -PI;
+    float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+    return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+}
+
+
+void rayOperation(inout Ray ray)
+{
+    ray.energy = getSkyboxPixel(ray);
+}
+float4 Shade(inout Ray ray, RayHit hit)
+{
+    float4 ret = float4(0,0,0,0);
+    if (hit.distance < 1.#INF && false)
+    {
+    }
+    else{
+        ray.energy = 0.0f;
+        ret = float4(getSkyboxPixel(ray),1);
+    }
+    return ret;
+}
+
+float3 fullRayCalculation(Ray ray)
+{
+    int stos[100];
+
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    _Pixel = id.xy;
+    //Result[id.xy] = float4(1, 0.5, 0.5, 0);
+    //return;
+    qHead = 0;
+    qTail = 0;
+    qSize = 0;
+    // Get the dimensions of the RenderTexture
+    uint width, height;
+    Result.GetDimensions(width, height);
+    float4 result = float4(0, 0, 0, 1);
+
+    // Transform pixel to [-1,1] range
+    float2 uv = float2((id.xy + _PixelOffset) / float2(width, height) * 2.0f - 1.0f);
+
+    // Get a ray for the UVs
+    Ray camRay = CreateCameraRay(uv);
+    //PushRay(camRay);
+    Ray ray = camRay;
+    //petlaGlowna
+    float4 tmp = float4(0, 0, 0, 1);
+    float ang = getBlackHoleAngle(_BlackHoles[0], ray);
+    if (ang < 0)
+    {
+        tmp = float4(0, 0, 0, 1);
+    }
+    else
+    {
+        Ray r2 = bendRay(ray, ray.origin, _BlackHoles[0].position, ang);
+        tmp = float4(getSkyboxPixel(r2), 1);
+
+    }
+    result += tmp;
+
+    result = result / 1.0f;
+
+    /*for (int i = 0; i < _rayLimit; i++)
+    {
+        //Ray ray;
+        //bool err = PopRay(ray);
+        
+        //promien istnieje
+        float ang = getBlackHoleAngle(_BlackHoles[0], ray);
+        if (ang < 0)
+        {
+            result = float4(0,0,0,1);
+        }
+        else
+        {
+            Ray r2 = bendRay(ray, ray.origin, _BlackHoles[0].position, ang);
+            result = float4(getSkyboxPixel(r2), 1);
+
+        }
+            
+        
+        break;
+        if (!any(ray.energy))
+        {
+            break;
+        }
+    }*/
+    Result[id.xy] = result;
+}
